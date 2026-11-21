@@ -134,11 +134,19 @@ class ConcurrencyLock:
 
 
 class AccountPoolManager:
-    """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
-    def __init__(self, store_instance):
+    """账号并发管理器：允许单账号最多 max_per_account 个并发任务，多账号并行执行。"""
+    def __init__(self, store_instance, max_per_account: int = 5):
         self.store = store_instance
-        self.busy_accounts: set[str] = set()
+        self.max_per_account = max(1, max_per_account)
+        self.active_counts: dict[str, int] = {}
         self.cond = threading.Condition()
+
+    @property
+    def busy_accounts(self) -> set[str]:
+        return {aid for aid, count in self.active_counts.items() if count >= self.max_per_account}
+
+    def is_account_in_use(self, account_id: str) -> bool:
+        return self.active_counts.get(account_id, 0) > 0
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
@@ -150,24 +158,26 @@ class AccountPoolManager:
                 if remaining is not None and remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
 
+                saturated = self.busy_accounts
                 if account_id:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
-                        self.busy_accounts.add(account_id)
+                    if account_id not in saturated:
+                        self.active_counts[account_id] = self.active_counts.get(account_id, 0) + 1
                         return acc
                 else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
+                    pref = preferred_id if preferred_id not in saturated else None
                     acc = self.store.pick_account(
                         preferred_id=pref,
                         rotate=rotate,
                         force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
+                        exclude_ids=saturated,
                         record_use=record_use,
                     )
                     if acc:
-                        self.busy_accounts.add(acc["id"])
+                        aid = acc["id"]
+                        self.active_counts[aid] = self.active_counts.get(aid, 0) + 1
                         return acc
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
@@ -180,7 +190,11 @@ class AccountPoolManager:
         if not account_id:
             return
         with self.cond:
-            self.busy_accounts.discard(account_id)
+            cur = self.active_counts.get(account_id, 0)
+            if cur <= 1:
+                self.active_counts.pop(account_id, None)
+            else:
+                self.active_counts[account_id] = cur - 1
             self.cond.notify_all()
 
 
@@ -219,9 +233,9 @@ def _account_operation(aid: str):
         account = store.get_account(aid)
         if not account:
             raise HTTPException(404, "账号不存在")
-        if aid in ACCOUNT_POOL.busy_accounts:
+        if ACCOUNT_POOL.is_account_in_use(aid):
             raise HTTPException(409, "账号正在执行任务或检测，请稍后再试")
-        ACCOUNT_POOL.busy_accounts.add(aid)
+        ACCOUNT_POOL.active_counts[aid] = ACCOUNT_POOL.max_per_account
         account = copy.deepcopy(account)
     try:
         _bind_account_proxy(account)
@@ -231,7 +245,9 @@ def _account_operation(aid: str):
             engine.close_current_page()
         finally:
             _clear_account_proxy()
-            ACCOUNT_POOL.release(aid)
+            with ACCOUNT_POOL.cond:
+                ACCOUNT_POOL.active_counts.pop(aid, None)
+                ACCOUNT_POOL.cond.notify_all()
 
 
 # ------------------------- OpenAI 风格的错误响应 -------------------------
@@ -2015,7 +2031,7 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
             raise HTTPException(404, "账号不存在")
         changes = {"label": req.label, "enabled": req.enabled}
         if "proxy" in req.model_fields_set:
-            if aid in ACCOUNT_POOL.busy_accounts:
+            if ACCOUNT_POOL.is_account_in_use(aid):
                 raise HTTPException(409, "账号正在执行任务或检测，请稍后再修改代理")
             proxy = req.proxy.configuration(existing.get("proxy")) if req.proxy else {}
             if proxy != (existing.get("proxy") or {}):
