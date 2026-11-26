@@ -559,6 +559,7 @@ class VideoRequest(BaseModel):
     files: list | None = None
     image_url: Any = None
     reference_image: str | None = None
+    account_id: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -1554,7 +1555,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
         try:
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
-            res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
+            res, acc_id = _run_generation(prompt, "video", timeout, account_id=req.account_id, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired, on_account=timing.account,
                 on_queue=timing.queued, on_error=timing.error)
             vurl = media_url(res["filename"])
