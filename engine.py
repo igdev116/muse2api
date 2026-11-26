@@ -1454,8 +1454,13 @@ class MuseEngine:
                         txt_stable += 1
                     else:
                         last_txt, txt_stable = cur_txt, 0
+                    transient_503 = self._transient_media_overload_text(cur_txt)
+                    if transient_503 and txt_stable >= 4 and elapsed > 6.0:
+                        raise MuseGenerationError(f"Muse 媒体服务暂时不可用: {transient_503}")
                     if txt_stable >= 15 and elapsed > 8.0:
                         clean = self._clean_model_text(cur_txt)
+                        if self._transient_media_overload_text(clean):
+                            raise MuseGenerationError(f"Muse 媒体服务暂时不可用: {clean}")
                         raise MuseModelRefusalError(
                             f"模型未生成媒体，仅返回文本: {clean}")
                 else:
@@ -1506,6 +1511,21 @@ class MuseEngine:
             r"\b(?:generated|created|rendered|completed|ready)\b|"
             r"\b(?:generated|created|rendered|completed)\b[^.\n]{0,32}"
             r"\b(?:video|clip|image|picture|animation)\b", text, re.I))
+
+    @classmethod
+    def _transient_media_overload_text(cls, text: str) -> str:
+        """Detect transient upstream 503/overload replies from Muse's chat assistant."""
+        if not text:
+            return ""
+        pattern = (
+            r"暂时不可用|服务不可用|服务繁忙|系统繁忙|请稍后再[试发]|"
+            r"(?:HTTP\s*)?\b503\b|service\s+unavailable|temporarily\s+unavailable|overloaded"
+        )
+        for line in reversed((text or "").splitlines()):
+            clean = cls._clean_model_text(line)
+            if clean and re.search(pattern, clean, re.I):
+                return clean
+        return ""
 
     @classmethod
     def _media_refusal_text(cls, text: str, expect: str) -> str:
@@ -1961,6 +1981,16 @@ class MuseEngine:
         return 0;
     })()"""
 
+    _FILE_INPUT_MULTIPLE_JS = "(function(){" + _COMPOSER_ROOTS_JS + """
+        var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+        var roots = __composerRoots();
+        for (var r of roots) {
+            var hit = inputs.find(function(x){ return r.contains(x); });
+            if (hit) return Boolean(hit.multiple);
+        }
+        return false;
+    })()"""
+
     def _set_input_files(self, paths: list[str]):
         """用 CDP 直接把磁盘文件交给上传控件（大视频不再经 base64 注入页面）。"""
         res = self.page.send("Runtime.evaluate", {
@@ -2006,14 +2036,34 @@ class MuseEngine:
         upload_dir = tempfile.mkdtemp(prefix="muse2api-refs-", dir=self.cfg.profile_dir)
         hashes = set()
         try:
+            all_paths = []
             for index, data, mime in files:
                 path = os.path.join(
                     upload_dir, f"reference_{index}{REFERENCE_MIME_EXT.get(mime, '.bin')}")
                 with open(path, "wb") as f:
                     f.write(data)
                 hashes.add(hashlib.sha256(data).hexdigest())
-                self._set_input_files([path])
-                time.sleep(0.35)
+                all_paths.append(path)
+
+            supports_multiple = len(all_paths) > 1 and bool(self.page.js(self._FILE_INPUT_MULTIPLE_JS))
+            if supports_multiple:
+                # Single batch upload matches dragging all files into muse.ai at once.
+                self._set_input_files(all_paths)
+            else:
+                for pos, path in enumerate(all_paths, start=1):
+                    # Wait for each file to register before overwriting a single-file input,
+                    # retrying once if React missed the change event under heavy concurrency.
+                    for attempt in range(2):
+                        self._set_input_files([path])
+                        step_deadline = time.monotonic() + (4.0 if attempt == 0 else 6.0)
+                        attached_now = 0
+                        while time.monotonic() < step_deadline:
+                            time.sleep(0.2)
+                            attached_now = int(self.page.js(self._ATTACHED_COUNT_JS) or 0)
+                            if attached_now >= pos:
+                                break
+                        if attached_now >= pos:
+                            break
         except MuseGenerationError:
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise
@@ -2023,7 +2073,7 @@ class MuseEngine:
 
         try:
             # A remove button proves attachment presence, not upstream processing success.
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + max(30.0, len(files) * 6.0)
             attached_count = 0
             while time.monotonic() < deadline:
                 attached_count = self.page.js(self._ATTACHED_COUNT_JS)
