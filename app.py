@@ -135,9 +135,10 @@ class ConcurrencyLock:
 
 class AccountPoolManager:
     """账号并发管理器：允许单账号最多 max_per_account 个并发任务，多账号并行执行。"""
-    def __init__(self, store_instance, max_per_account: int = 5):
+    def __init__(self, store_instance, max_per_account: int | None = None):
         self.store = store_instance
-        self.max_per_account = max(1, max_per_account)
+        resolved = max_per_account if max_per_account is not None else int(os.environ.get("MUSE2API_MAX_PER_ACCOUNT", "10"))
+        self.max_per_account = max(1, resolved)
         self.active_counts: dict[str, int] = {}
         self.cond = threading.Condition()
 
