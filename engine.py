@@ -361,6 +361,70 @@ class MuseEngine:
     def _debug_url(self):
         return f"http://127.0.0.1:{self.cfg.cdp_port}/json/version"
 
+    def _read_chromium_log_tail(self, limit: int = 240) -> str:
+        log_path = os.path.join(self.cfg.data_dir, "chromium.log")
+        try:
+            with open(log_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 2048))
+                text = fh.read().decode("utf-8", errors="replace").strip()
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                return " | ".join(lines[-3:])[-limit:]
+        except Exception:
+            return ""
+
+    def _spawn_and_connect(self, profile_dir: str, env: dict, cwd_dir: str | None) -> tuple[bool, str]:
+        os.makedirs(profile_dir, exist_ok=True)
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lp = os.path.join(profile_dir, lock_name)
+            if os.path.exists(lp) or os.path.islink(lp):
+                try:
+                    os.unlink(lp)
+                except Exception:
+                    pass
+
+        args = [
+            self.cfg.chromium,
+            "--headless=new", "--no-sandbox", "--disable-gpu",
+            "--disable-dev-shm-usage", "--disable-background-networking",
+            "--no-first-run", "--no-default-browser-check",
+            "--autoplay-policy=no-user-gesture-required",
+            "--window-size=1440,2400",
+            f"--remote-debugging-port={self.cfg.cdp_port}",
+            "--remote-allow-origins=*",
+            f"--user-data-dir={profile_dir}",
+            "about:blank",
+        ]
+        os.makedirs(self.cfg.data_dir, exist_ok=True)
+        if self._log:
+            try:
+                self._log.close()
+            except Exception:
+                pass
+        self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "wb", buffering=0)
+        popen_kwargs: dict = {"stdout": self._log, "stderr": subprocess.STDOUT, "env": env, "cwd": cwd_dir}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.proc = subprocess.Popen(args, **popen_kwargs)
+        last = ""
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                code = self.proc.returncode
+                self.proc = None
+                tail = self._read_chromium_log_tail()
+                return False, f"exit={code}" + (f" ({tail})" if tail else "")
+            try:
+                v = http_json(self._debug_url(), timeout=2)
+                self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                return True, ""
+            except Exception as exc:  # noqa: BLE001
+                last = str(exc)
+                time.sleep(0.5)
+        tail = self._read_chromium_log_tail()
+        return False, (last or "CDP timeout") + (f" ({tail})" if tail else "")
+
     def start(self):
         with self._start_lock:
             if self.proc and self.proc.poll() is None and self.browser:
@@ -381,18 +445,7 @@ class MuseEngine:
             env = dict(os.environ)
             env.setdefault("HOME", self.cfg.home_dir)
             env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
-            args = [
-                self.cfg.chromium,
-                "--headless=new", "--no-sandbox", "--disable-gpu",
-                "--disable-dev-shm-usage", "--disable-background-networking",
-                "--no-first-run", "--no-default-browser-check",
-                "--autoplay-policy=no-user-gesture-required",
-                "--window-size=1440,2400",
-                f"--remote-debugging-port={self.cfg.cdp_port}",
-                "--remote-allow-origins=*",
-                f"--user-data-dir={self.cfg.profile_dir}",
-                "about:blank",
-            ]
+
             # 尝试复用已有健康 CDP
             if not self.proc:
                 try:
@@ -403,35 +456,27 @@ class MuseEngine:
                 except Exception:
                     pass
 
-            # 清理残留锁
-            for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-                lp = os.path.join(self.cfg.profile_dir, lock_name)
-                if os.path.exists(lp) or os.path.islink(lp):
-                    try:
-                        os.unlink(lp)
-                    except Exception:
-                        pass
-
-            os.makedirs(self.cfg.data_dir, exist_ok=True)
-            self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
-            popen_kwargs: dict = {"stdout": self._log, "stderr": subprocess.STDOUT, "env": env, "cwd": cwd_dir}
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self.proc = subprocess.Popen(args, **popen_kwargs)
-            last = None
-            deadline = time.monotonic() + 45.0
-            while time.monotonic() < deadline:
-                if self.proc.poll() is not None:
-                    raise MuseGenerationError(f"Chromium 进程已提前退出 (exit={self.proc.returncode})")
-                try:
-                    v = http_json(self._debug_url(), timeout=2)
-                    self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+            ok, reason = self._spawn_and_connect(self.cfg.profile_dir, env, cwd_dir)
+            if ok:
+                return
+
+            # On Windows, an orphaned Chrome process from a previous run can lock profile_dir
+            # and make the new Chrome hand off and exit immediately with code 0.
+            # Retry once with an isolated per-process profile directory so recovery is automatic.
+            if self.proc is None:
+                fallback_profile = os.path.join(
+                    self.cfg.profile_root, f"generate-{os.getpid()}-{self.cfg.cdp_port}"
+                )
+                log.warning("Chromium 首次启动退出 (%s)，尝试独立 profile 目录: %s", reason, fallback_profile)
+                ok2, reason2 = self._spawn_and_connect(fallback_profile, env, cwd_dir)
+                if ok2:
+                    self._fallback_profile_dir = fallback_profile
                     return
-                except Exception as exc:  # noqa: BLE001
-                    last = exc
-                    time.sleep(0.5)
-            raise MuseGenerationError(f"Chromium 启动失败: {last}")
+                shutil.rmtree(fallback_profile, ignore_errors=True)
+                reason = f"{reason}; fallback: {reason2}"
+
+            raise MuseGenerationError(f"Chromium 启动失败: {reason}")
 
     def stop(self):
         with self._start_lock:
@@ -466,6 +511,10 @@ class MuseEngine:
                 self._download_dirs.clear()
             for directory in download_dirs:
                 shutil.rmtree(directory, ignore_errors=True)
+            fallback_profile = getattr(self, "_fallback_profile_dir", None)
+            if fallback_profile:
+                self._fallback_profile_dir = None
+                shutil.rmtree(fallback_profile, ignore_errors=True)
 
     # ---------------- 页面 ----------------
     @property
