@@ -364,7 +364,20 @@ class MuseEngine:
     def start(self):
         with self._start_lock:
             if self.proc and self.proc.poll() is None and self.browser:
-                return
+                if not hasattr(self.browser, "is_connected") or self.browser.is_connected():
+                    return
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+                try:
+                    v = http_json(self._debug_url(), timeout=2)
+                    if v and "webSocketDebuggerUrl" in v:
+                        self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
+                        return
+                except Exception:
+                    pass
             env = dict(os.environ)
             env.setdefault("HOME", self.cfg.home_dir)
             env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
@@ -402,17 +415,22 @@ class MuseEngine:
             os.makedirs(self.cfg.data_dir, exist_ok=True)
             self._log = open(os.path.join(self.cfg.data_dir, "chromium.log"), "ab", buffering=0)
             cwd_dir = self.cfg.home_dir if (self.cfg.home_dir and os.path.isdir(self.cfg.home_dir)) else None
-            self.proc = subprocess.Popen(args, stdout=self._log, stderr=subprocess.STDOUT,
-                                         env=env, cwd=cwd_dir)
+            popen_kwargs: dict = {"stdout": self._log, "stderr": subprocess.STDOUT, "env": env, "cwd": cwd_dir}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.proc = subprocess.Popen(args, **popen_kwargs)
             last = None
-            for _ in range(90):
+            deadline = time.monotonic() + 45.0
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    raise MuseGenerationError(f"Chromium 进程已提前退出 (exit={self.proc.returncode})")
                 try:
                     v = http_json(self._debug_url(), timeout=2)
                     self.browser = CDP(v["webSocketDebuggerUrl"], timeout=180)
                     return
                 except Exception as exc:  # noqa: BLE001
                     last = exc
-                    time.sleep(1)
+                    time.sleep(0.5)
             raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):

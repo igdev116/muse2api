@@ -16,22 +16,41 @@ class CDPError(RuntimeError):
 
 class CDP:
     def __init__(self, ws_url: str, timeout: float = 90.0, max_size: int = 256 << 20):
-        self.ws = websocket.create_connection(ws_url, timeout=timeout, max_size=max_size)
+        # Local CDP must never traverse system HTTP_PROXY/HTTPS_PROXY on Windows/macOS.
+        self.ws = websocket.create_connection(
+            ws_url,
+            timeout=timeout,
+            max_size=max_size,
+            http_no_proxy=["127.0.0.1", "localhost", "::1"],
+        )
         self.timeout = timeout
         self._id = 0
         self._lock = threading.Lock()
+
+    def is_connected(self) -> bool:
+        return bool(getattr(self, "ws", None) and getattr(self.ws, "connected", False))
 
     def send(self, method: str, params: dict | None = None, timeout: float | None = None):
         with self._lock:
             self._id += 1
             mid = self._id
-            self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            try:
+                self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+            except Exception as exc:  # noqa: BLE001
+                raise CDPError(f"CDP {method} 发送失败: {exc}") from exc
             deadline = time.time() + (timeout or self.timeout)
             while time.time() < deadline:
                 try:
-                    msg = json.loads(self.ws.recv())
+                    raw = self.ws.recv()
+                    if not raw:
+                        raise CDPError(f"CDP {method} 连接已关闭")
+                    msg = json.loads(raw)
                 except websocket.WebSocketTimeoutException:
                     continue
+                except (websocket.WebSocketConnectionClosedException, OSError, EOFError) as exc:
+                    raise CDPError(f"CDP {method} 连接已断开: {exc}") from exc
+                except CDPError:
+                    raise
                 except Exception:  # noqa: BLE001
                     continue
                 if msg.get("id") == mid:
@@ -70,4 +89,7 @@ class CDP:
 
 
 def http_json(url: str, timeout: float = 5.0):
-    return requests.get(url, timeout=timeout).json()
+    # Bypass Windows/OS system proxy settings for local loopback CDP endpoints.
+    with requests.Session() as session:
+        session.trust_env = False
+        return session.get(url, timeout=timeout).json()
